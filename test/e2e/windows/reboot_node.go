@@ -19,13 +19,18 @@ package windows
 import (
 	"context"
 	"strconv"
+	"strings"
 	"time"
+
+	"bytes"
+	"encoding/base64"
+	"encoding/binary"
+	"unicode/utf16"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	"k8s.io/apimachinery/pkg/util/uuid"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/test/e2e/feature"
@@ -50,6 +55,8 @@ var _ = sigDescribe(feature.Windows, "[Excluded:WindowsDocker] [MinimumKubeletVe
 		targetNode, err := findWindowsNode(ctx, f)
 		framework.ExpectNoError(err, "Error finding Windows node")
 		framework.Logf("Using node: %v", targetNode.Name)
+
+		ginkgo.DeferCleanup(cleanupContainer, f, targetNode.Name)
 
 		bootID, err := strconv.Atoi(targetNode.Status.NodeInfo.BootID)
 		framework.ExpectNoError(err, "Error converting bootID to int")
@@ -269,3 +276,104 @@ var _ = sigDescribe(feature.Windows, "[Excluded:WindowsDocker] [MinimumKubeletVe
 		gomega.Expect(p.Status.Phase).To(gomega.Equal(v1.PodSucceeded))
 	})
 }))
+
+func cleanupContainer(ctx context.Context, f *framework.Framework, nodeName string) {
+	framework.Logf("Running HostProcess cleanup pod to remove stuck reboot containers")
+
+	trueVar := true
+	podName := "reboot-cleanup-pod"
+	containerName := "cleanup-container"
+	namespace := f.Namespace.Name
+	user := "NT AUTHORITY\\SYSTEM"
+	windowsImage := imageutils.GetE2EImage(imageutils.Agnhost)
+
+	cmd := `$lines = & "$Env:ProgramFiles\\containerd\\ctr.exe" -n k8s.io containers list | Select-String e2e-test-images;
+	foreach ($line in $lines) {
+		$columns = $line.ToString().Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries);
+		$containerId = $columns[0].ToLower();
+		$json = & "$Env:ProgramFiles\\containerd\\ctr.exe" -n k8s.io containers info $containerId | ConvertFrom-Json
+		$containerName = $json.Labels.'io.kubernetes.container.name';
+		$podName = $json.Labels.'io.kubernetes.pod.name';
+		$nsName = $json.Labels.'io.kubernetes.pod.namespace';
+
+		if ($containerName -eq "$CONTAINERNAME$" -and $nsName -eq "$NAMESPACE$") {
+			Write-Host "Skipping container $containerId, $containerName, $podName, $nsName";
+			continue;
+		}
+
+		Write-Host "Deleting container $containerId, $containerName, $podName, $nsName";
+		try {
+			& "$Env:ProgramFiles\\containerd\\ctr.exe" -n k8s.io containers delete $containerId;
+		} catch {
+			Write-Host "Failed to delete container $containerId, $containerName, $podName, $nsName";
+			Write-Host $_.Exception.Message;
+		}
+	}
+	Write-Host "Rebooting host";
+	shutdown.exe -r -t 5;`
+
+	// replace the container name and namespace in the command
+	cmd = strings.ReplaceAll(cmd, "$CONTAINERNAME$", containerName)
+	cmd = strings.ReplaceAll(cmd, "$NAMESPACE$", namespace)
+
+	cleanupPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: podName,
+		},
+		Spec: v1.PodSpec{
+			SecurityContext: &v1.PodSecurityContext{
+				WindowsOptions: &v1.WindowsSecurityContextOptions{
+					HostProcess:   &trueVar,
+					RunAsUserName: &user,
+				},
+			},
+			HostNetwork: true,
+			Containers: []v1.Container{
+				{
+					Name:  containerName,
+					Image: windowsImage, // Or another HostProcess-compatible image
+					Command: []string{
+						"powershell.exe",
+						"-encodedCommand",
+						encodePowerShellCommand(cmd),
+					},
+				},
+			},
+			RestartPolicy: v1.RestartPolicyNever,
+			NodeName:      nodeName,
+		},
+	}
+
+	// Launch the pod
+	e2epod.NewPodClient(f).Create(ctx, cleanupPod)
+	e2epod.NewPodClient(f).WaitForFinish(ctx, podName, 2*time.Minute)
+
+	p, err := f.ClientSet.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		framework.Logf("Error retrieving cleanup pod: %v", err)
+	} else {
+		framework.Logf("Cleanup pod status: %s", p.Status.Phase)
+	}
+
+	// Delete the cleanup pod
+	err = f.ClientSet.CoreV1().Pods(namespace).Delete(ctx, podName, metav1.DeleteOptions{})
+	if err != nil {
+		framework.Logf("Error deleting cleanup pod: %v", err)
+	} else {
+		framework.Logf("Cleanup pod deleted")
+	}
+}
+
+func encodePowerShellCommand(cmd string) string {
+	// Convert string to UTF-16 (code units)
+	utf16Cmd := utf16.Encode([]rune(cmd))
+
+	// Convert to bytes in little endian (UTF-16LE)
+	buf := new(bytes.Buffer)
+	for _, r := range utf16Cmd {
+		_ = binary.Write(buf, binary.LittleEndian, r)
+	}
+
+	// Base64 encode
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
