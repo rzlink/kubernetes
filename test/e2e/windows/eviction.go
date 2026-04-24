@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2ekubelet "k8s.io/kubernetes/test/e2e/framework/kubelet"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
@@ -99,6 +100,36 @@ var _ = sigDescribe(feature.Windows, "Eviction", framework.WithSerial(), framewo
 		framework.Logf("Node %q hard eviction threshold: %v Mi", node.Name, nodeMem.hardEviction.Value()/(1024*1024))
 		framework.Logf("Available memory before eviction: %v Mi", (nodeMem.capacity.Value()-nodeMem.hardEviction.Value())/(1024*1024))
 
+		// Skip this test on Hyper-V nodes. Hyper-V containers run inside
+		// lightweight VMs with dynamic memory, so testlimit.exe inside a pod
+		// cannot create real host memory pressure — the balloon driver reclaims
+		// pages and the host pages out VM memory to its pagefile.
+		for _, rh := range node.Status.RuntimeHandlers {
+			if rh.Name == "runhcs-wcow-hypervisor" {
+				e2eskipper.Skipf("Eviction test is not supported on Hyper-V nodes (memory pressure cannot be created from inside a VM)")
+			}
+		}
+
+		// Query kubelet stats for the actual memory capacity used by the eviction manager.
+		// On Windows, the eviction manager checks CommitLimit (RAM + pagefile), not physical RAM.
+		// The windows-global-commit-memory system container reports CommitLimit as Available + Usage.
+		memoryCapacity := nodeMem.capacity.Value()
+		summary, err := e2ekubelet.GetStatsSummary(ctx, f.ClientSet, node.Name)
+		if err != nil {
+			framework.Logf("Warning: failed to get stats summary, falling back to node capacity: %v", err)
+		} else {
+			for _, sc := range summary.Node.SystemContainers {
+				if sc.Name == "windows-global-commit-memory" {
+					if sc.Memory != nil && sc.Memory.AvailableBytes != nil && sc.Memory.UsageBytes != nil {
+						memoryCapacity = int64(*sc.Memory.AvailableBytes + *sc.Memory.UsageBytes)
+						framework.Logf("Node %q CommitLimit (from kubelet stats): %v Mi", node.Name, memoryCapacity/(1024*1024))
+					}
+					break
+				}
+			}
+		}
+		framework.Logf("Using CommitLimit %v Mi for eviction calculation (node RAM: %v Mi)", memoryCapacity/(1024*1024), nodeMem.capacity.Value()/(1024*1024))
+
 		err = waitForMemoryPressureTaintRemoval(ctx, f, node.Name, 10*time.Minute)
 		framework.ExpectNoError(err, "Timed out waiting for memory-pressure taint to be removed from node %q", node.Name)
 
@@ -145,7 +176,7 @@ var _ = sigDescribe(feature.Windows, "Eviction", framework.WithSerial(), framewo
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Scheduling another pod will consume the rest of the node's memory")
-		chunks := int((nodeMem.capacity.Value()-nodeMem.hardEviction.Value())/(300*1024*1024) + 3)
+		chunks := int((memoryCapacity-nodeMem.hardEviction.Value())/(300*1024*1024) + 3)
 		framework.Logf("Pod2 will request approximately %v Mi total memory (%d chunks × 300Mi)", chunks*300, chunks)
 
 		pod2 := &v1.Pod{
@@ -227,7 +258,7 @@ var _ = sigDescribe(feature.Windows, "Eviction", framework.WithSerial(), framewo
 				return nil
 			}
 			return fmt.Errorf("pod2 not evicted yet; still waiting")
-		}).WithTimeout(10*time.Minute).WithPolling(10*time.Second).Should(gomega.Succeed(), "pod2 should eventually be evicted")
+		}).WithTimeout(15*time.Minute).WithPolling(10*time.Second).Should(gomega.Succeed(), "pod2 should eventually be evicted")
 
 		ginkgo.By("Waiting for node.kubernetes.io/memory-pressure taint to be removed")
 		// ensure e2e test framework catches the memory-pressure taint
