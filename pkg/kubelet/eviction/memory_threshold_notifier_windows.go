@@ -63,20 +63,23 @@ func (m *windowsMemoryThresholdNotifier) Start(ctx context.Context) {
 }
 
 func (m *windowsMemoryThresholdNotifier) checkMemoryUsage(logger klog.Logger) {
-	// Get global commit limit
 	perfInfo, err := winstats.GetPerformanceInfo()
 	if err != nil {
 		logger.Error(err, "Eviction manager: error getting global memory status for node")
+		return
 	}
 
-	commmiLimitBytes := perfInfo.CommitLimitPages * perfInfo.PageSize
-	capacity := resource.NewQuantity(int64(commmiLimitBytes), resource.BinarySI)
+	// Use physical memory for eviction decisions, not commit memory.
+	// CommitLimit includes the pagefile, which inflates capacity and hides real memory pressure.
+	// Physical memory pressure (low PhysicalAvailable) is what causes performance degradation
+	// and is consistent with how Linux eviction works (MemAvailable from /proc/meminfo).
+	physTotalBytes := perfInfo.PhysicalTotalPages * perfInfo.PageSize
+	capacity := resource.NewQuantity(int64(physTotalBytes), resource.BinarySI)
 	evictionThresholdQuantity := evictionapi.GetThresholdQuantity(m.threshold.Value, capacity)
 
-	commitTotalBytes := perfInfo.CommitTotalPages * perfInfo.PageSize
-	commitAvailableBytes := commmiLimitBytes - commitTotalBytes
+	physAvailBytes := perfInfo.PhysicalAvailablePages * perfInfo.PageSize
 
-	if commitAvailableBytes <= uint64(evictionThresholdQuantity.Value()) {
+	if physAvailBytes <= uint64(evictionThresholdQuantity.Value()) {
 		m.events <- struct{}{}
 	}
 }

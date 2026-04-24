@@ -27,6 +27,22 @@ import (
 
 func makeMemoryAvailableSignalObservation(logger klog.Logger, summary *statsapi.Summary) *signalObservation {
 	logger.V(4).Info("Eviction manager: building memory signal observations for windows")
+
+	// Use physical memory stats from Node.Memory (populated from PhysicalAvailable/PhysicalTotal)
+	// for consistency with the threshold notifier, which also uses physical memory.
+	if memory := summary.Node.Memory; memory != nil && memory.AvailableBytes != nil && memory.WorkingSetBytes != nil {
+		logger.V(4).Info(
+			"Eviction manager: memory signal observations for windows",
+			"Available", *memory.AvailableBytes,
+			"WorkingSet", *memory.WorkingSetBytes)
+		return &signalObservation{
+			available: resource.NewQuantity(int64(*memory.AvailableBytes), resource.BinarySI),
+			capacity:  resource.NewQuantity(int64(*memory.AvailableBytes+*memory.WorkingSetBytes), resource.BinarySI),
+			time:      memory.Time,
+		}
+	}
+
+	// Fallback to commit-based stats from the windows-global-commit-memory system container
 	sysContainer, err := getSysContainer(summary.Node.SystemContainers, statsapi.SystemContainerWindowsGlobalCommitMemory)
 	if err != nil {
 		logger.Error(err, "Eviction manager: failed to construct signal", "signal", evictionapi.SignalMemoryAvailable)
@@ -34,7 +50,7 @@ func makeMemoryAvailableSignalObservation(logger klog.Logger, summary *statsapi.
 	}
 	if memory := sysContainer.Memory; memory != nil && memory.AvailableBytes != nil && memory.UsageBytes != nil {
 		logger.V(4).Info(
-			"Eviction manager: memory signal observations for windows",
+			"Eviction manager: memory signal observations for windows (fallback to commit)",
 			"Available", *memory.AvailableBytes,
 			"Usage", *memory.UsageBytes)
 		return &signalObservation{
@@ -42,7 +58,6 @@ func makeMemoryAvailableSignalObservation(logger klog.Logger, summary *statsapi.
 			capacity:  resource.NewQuantity(int64(*memory.AvailableBytes+*memory.UsageBytes), resource.BinarySI),
 			time:      memory.Time,
 		}
-	} else {
-		return nil
 	}
+	return nil
 }
