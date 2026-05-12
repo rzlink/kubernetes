@@ -604,20 +604,27 @@ var _ = sigDescribe(feature.WindowsHostProcessContainers, "HostProcess container
 		e2epod.NewPodClient(f).Create(ctx, pod)
 		e2epod.NewPodClient(f).WaitForFinish(ctx, podName, 3*time.Minute)
 
-		ginkgo.By("Getting subsequent kubelet metrics values")
-
-		afterMetrics, err := getCurrentHostProcessMetrics(ctx, f, targetNode.Name)
-		framework.ExpectNoError(err, "Error getting subsequent kubelet metrics for node")
+		// Note: This test performs relative comparisons to ensure metrics values were logged and does not validate specific values.
+		// This is done so the test can be run in parallel with other tests which may start HostProcess containers on the same node.
+		ginkgo.By("Ensuring metrics were updated")
+		// Poll until kubelet metrics catch up. Pod completion (WaitForFinish) does not
+		// guarantee that the kubelet has updated its prometheus counters yet — there can
+		// be a small flush delay, especially under load.
+		var afterMetrics HostProcessContainersMetrics
+		gomega.Eventually(ctx, func() (HostProcessContainersMetrics, error) {
+			m, err := getCurrentHostProcessMetrics(ctx, f, targetNode.Name)
+			if err == nil {
+				afterMetrics = m
+			}
+			return m, err
+		}, f.Timeouts.PodStartShort, framework.PollInterval()).Should(gomega.SatisfyAll(
+			gomega.HaveField("StartedContainersCount", gomega.BeNumerically(">", beforeMetrics.StartedContainersCount)),
+			gomega.HaveField("StartedContainersErrorCount", gomega.BeNumerically(">", beforeMetrics.StartedContainersErrorCount)),
+			gomega.HaveField("StartedInitContainersCount", gomega.BeNumerically(">", beforeMetrics.StartedInitContainersCount)),
+			gomega.HaveField("StartedInitContainersErrorCount", gomega.BeNumerically(">", beforeMetrics.StartedInitContainersErrorCount)),
+		), "HostProcess container metrics should increase after running pods")
 		framework.Logf("Subsequent HostProcess container metrics -- StartedContainers: %v, StartedContainersErrors: %v, StartedInitContainers: %v, StartedInitContainersErrors: %v",
 			afterMetrics.StartedContainersCount, afterMetrics.StartedContainersErrorCount, afterMetrics.StartedInitContainersCount, afterMetrics.StartedInitContainersErrorCount)
-
-		// Note: This test performs relative comparisons to ensure metrics values were logged and does not validate specific values.
-		// This done so the test can be run in parallel with other tests which may start HostProcess containers on the same node.
-		ginkgo.By("Ensuring metrics were updated")
-		gomega.Expect(beforeMetrics.StartedContainersCount).To(gomega.BeNumerically("<", afterMetrics.StartedContainersCount), "Count of started HostProcess containers should increase")
-		gomega.Expect(beforeMetrics.StartedContainersErrorCount).To(gomega.BeNumerically("<", afterMetrics.StartedContainersErrorCount), "Count of started HostProcess errors containers should increase")
-		gomega.Expect(beforeMetrics.StartedInitContainersCount).To(gomega.BeNumerically("<", afterMetrics.StartedInitContainersCount), "Count of started HostProcess init containers should increase")
-		gomega.Expect(beforeMetrics.StartedInitContainersErrorCount).To(gomega.BeNumerically("<", afterMetrics.StartedInitContainersErrorCount), "Count of started HostProcess errors init containers should increase")
 	})
 
 	ginkgo.It("container stats validation", func(ctx context.Context) {
@@ -656,14 +663,16 @@ var _ = sigDescribe(feature.WindowsHostProcessContainers, "HostProcess container
 		e2epod.NewPodClient(f).Create(ctx, pod)
 
 		ginkgo.By("Waiting for the pod to start running")
-		timeout := 3 * time.Minute
-		err = e2epod.WaitForPodsRunningReady(ctx, f.ClientSet, f.Namespace.Name, 1, timeout)
+		err = e2epod.WaitForPodsRunningReady(ctx, f.ClientSet, f.Namespace.Name, 1, f.Timeouts.PodStart)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Getting container stats for pod")
 		statsChecked := false
 
-		wait.Poll(2*time.Second, timeout, func() (bool, error) {
+		// Poll until container stats are reported. On runtimes with slower container
+		// startup (e.g. VM-isolated containers), the kubelet stats summary may take
+		// longer to include cpu/memory/log usage for the new container.
+		wait.Poll(2*time.Second, f.Timeouts.PodStart, func() (bool, error) {
 			return ensurePodsStatsOnNode(ctx, f.ClientSet, f.Namespace.Name, targetNode.Name, &statsChecked)
 		})
 
