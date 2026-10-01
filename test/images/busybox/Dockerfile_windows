@@ -55,6 +55,7 @@ RUN mkdir /curl-full /curl-dir && \
 FROM --platform=linux/amd64 $REGISTRY/windows-servercore-cache:1.0-linux-amd64-$OS_VERSION as servercore-helper
 FROM --platform=linux/amd64 e2eteam/powershell-helper:6.2.7-linux-cache as ps-helper
 FROM $BASEIMAGE
+ARG OS_VERSION
 
 COPY --from=prep /tmp-dir /tmp
 COPY --from=prep /busybox-dir /bin
@@ -78,6 +79,10 @@ COPY --from=ps-helper /Users/ContainerAdministrator/AppData/Local/Microsoft/Wind
 ADD hostname /bin/hostname.exe
 
 USER ContainerAdministrator
+
+COPY install-remotefs.cmd /install-remotefs.cmd
+RUN %SystemDrive%\install-remotefs.cmd %OS_VERSION% install
+RUN %SystemDrive%\install-remotefs.cmd %OS_VERSION% configure && del %SystemDrive%\install-remotefs.cmd
 
 # NOTE(claudiub): docker buildx sets the PATH env variable to a Linux-like PATH, which is not desirable.
 ENV PATH="C:\dig\;C:\bin;C:\curl;C:\Windows\System32;C:\Windows;C:\Program Files\PowerShell;" \
